@@ -88,7 +88,7 @@
 
 ### 方式一：下载 exe（推荐普通用户）
 
-1. 前往 [Releases](https://github.com/YOUR_USERNAME/YOUR_REPO/releases) 页面
+1. 前往 [Releases]([https://github.com/YOUR_USERNAME/YOUR_REPO/releases](https://github.com/Telepath-LXR/Albumtools_for_Netease/releases)) 页面
 2. 下载最新的 `NeteaseAlbumExport.exe`
 3. 双击运行
 
