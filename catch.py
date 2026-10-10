@@ -147,8 +147,8 @@ def _kill_proc(proc):
 
 def try_remote_debugging(browser_name='chrome'):
     """
-    独立目录 + 远程调试端口 9222。
-    首次需要登录一次，之后 Cookie 会被缓存。
+    独立目录 + 远程调试协议。
+    启动前无条件杀掉同名浏览器进程（Chromium 的进程转发行为会吞掉调试参数）。
     """
     try:
         import websocket
@@ -161,82 +161,153 @@ def try_remote_debugging(browser_name='chrome'):
         print(f"[浏览器] 未找到 {browser_name}")
         return None
 
-    # 独立目录，不跟日常浏览器冲突
+    if browser_name == 'chrome':
+        proc_name = 'chrome.exe'
+        display_name = 'Chrome'
+    elif browser_name == 'edge':
+        proc_name = 'msedge.exe'
+        display_name = 'Edge'
+    else:
+        print(f"[浏览器] 不支持 {browser_name}")
+        return None
+
+    # ========== ⭐ 无条件杀掉所有同名进程 ==========
+    # Chromium 有"进程转发"行为：只要有同名进程在跑，
+    # 新启动的命令会把参数转发过去然后自己退出（返回码 0）。
+    # 所以必须先杀干净。
+    print(f"\n[浏览器] 正在清理所有 {display_name} 进程...")
+    killed_any = False
+    for round_idx in range(5):
+        try:
+            result = subprocess.run(
+                ['taskkill', '/F', '/IM', proc_name],
+                capture_output=True, text=True,
+                encoding='gbk', errors='ignore', timeout=10
+            )
+            # taskkill 成功时会输出 SUCCESS 或中文提示
+            stdout = result.stdout or ''
+            if '成功' in stdout or 'SUCCESS' in stdout.upper():
+                killed_any = True
+        except Exception:
+            pass
+        time.sleep(1.5)
+        if not _is_process_running(proc_name):
+            break
+    else:
+        print(f"[浏览器] ⚠️  {proc_name} 仍在运行")
+        print(f"[浏览器] 请手动打开任务管理器，结束所有 {display_name} 进程后重试")
+        return None
+
+    if killed_any:
+        print(f"[浏览器] 已清理 {display_name} 进程")
+    else:
+        print(f"[浏览器] 没有残留进程")
+    time.sleep(2)  # 等端口和句柄释放
+
+    # ========== 独立持久化目录 ==========
     debug_dir = str(Path.home() / ".netease_album_export" / f"{browser_name}_profile")
     Path(debug_dir).mkdir(parents=True, exist_ok=True)
+
+    # 清理可能残留的锁文件
+    for lock_name in ['SingletonLock', 'SingletonCookie', 'SingletonSocket']:
+        p = Path(debug_dir) / lock_name
+        if p.exists():
+            try:
+                p.unlink()
+            except Exception:
+                pass
 
     first_time = not (Path(debug_dir) / "Default" / "Cookies").exists()
     if first_time:
         print("\n" + "=" * 60)
-        print(f"  ⚠️  首次使用 {browser_name} 自动导入")
+        print(f"  ⚠️  首次使用 {display_name} 自动导入")
         print("=" * 60)
-        print(f"  需要用 {browser_name} 登录一次网易云音乐。")
+        print(f"  需要用 {display_name} 登录一次网易云音乐。")
         print(f"  登录页面可能加载较慢，请耐心等待。")
-        print(f"  登录成功后脚本会自动抓取 Cookie，以后就不用再登了。")
+        print("=" * 60)
+        print(f"  ⭐ 登录完成后【不要关闭浏览器】，脚本会自动检测")
         print("=" * 60)
         input("\n  按回车继续...")
 
-    print(f"\n[浏览器] 启动 {browser_name} 调试实例...")
+    # ========== 找空闲端口 ==========
+    port = _find_free_port(9222)
+    if not port:
+        print("[浏览器] 找不到空闲端口")
+        return None
+
+    print(f"\n[浏览器] 启动 {display_name} 调试实例...")
     print(f"[浏览器] 配置目录：{debug_dir}")
+    print(f"[浏览器] 使用端口：{port}")
 
     proc = subprocess.Popen([
         browser_path,
-        "--remote-debugging-port=9222",
+        f"--remote-debugging-port={port}",
         "--remote-allow-origins=*",
         f"--user-data-dir={debug_dir}",
         "--no-first-run",
         "--no-default-browser-check",
+        "--disable-sync",
+        "--disable-background-networking",
+        "--disable-features=TrackingProtection3pcd,PrivacySandboxSettings4,"
+        "msTrackingPrevention,EdgeTrackingPrevention,"
+        "msEdgeWelcomePage,msEdgeIdentityFeaturePromotion,"
+        "SafeBrowsingEnhancedProtection,SafeBrowsing",
+        "--ignore-certificate-errors",
         "https://music.163.com"
     ])
 
-    # 等待端口就绪
+    # ========== 等端口 ==========
     print("[浏览器] 等待调试端口就绪...")
     port_ready = False
-    for _ in range(15):
+    for i in range(30):
         time.sleep(2)
         if proc.poll() is not None:
-            print(f"[浏览器] Chrome 已退出（返回码 {proc.returncode}）")
+            print(f"[浏览器] {display_name} 已退出（返回码 {proc.returncode}）")
+            print(f"[浏览器] 可能原因：")
+            print(f"  1. 杀进程后还有残留（重启电脑试试）")
+            print(f"  2. 配置目录损坏（删除 {debug_dir} 后重试）")
             return None
         try:
             requests.get(
-                "http://localhost:9222/json",
+                f"http://localhost:{port}/json",
                 timeout=3,
                 proxies={"http": None, "https": None}
             )
             port_ready = True
             break
         except Exception:
-            pass
+            if (i + 1) % 5 == 0:
+                print(f"[浏览器] 第 {i+1} 次尝试，端口未就绪...")
 
     if not port_ready:
-        print("[浏览器] 30 秒内端口未就绪")
-        print()
-        print("  ⚠️  建议：")
-        print("  1. 打开任务管理器，结束所有 chrome.exe / msedge.exe")
-        print("  2. 如果反复失败，试试重启电脑")
-        print("  3. 或者改用'手动粘贴 Cookie'方式（选项 4）")
+        print("[浏览器] 60 秒内端口未就绪")
         _kill_proc(proc)
         return None
 
-    print("[浏览器] 端口已就绪")
-    print("\n" + "=" * 60)
-    print(f"  请在浏览器中登录网易云音乐")
-    print(f"  如果登录按钮点不动，直接在地址栏访问：")
-    print(f"  https://music.163.com/#/login")
-    print("=" * 60 + "\n")
+    print("[浏览器] 调试端口已就绪")
+    print()
+    print("=" * 60)
+    print(f"  ⭐ 请在 {display_name} 中登录网易云音乐")
+    print(f"  ⭐ 登录完成后【不要关闭浏览器】，脚本会自动检测")
+    print(f"  ⭐ 如果登录按钮点不动，直接在地址栏访问：")
+    print(f"     https://music.163.com/#/login")
+    print("=" * 60)
+    print()
 
+    # ========== 抓 Cookie ==========
     cookie_dict = None
-    deadline = time.time() + 600  # 首次登录给 10 分钟
+    deadline = time.time() + 600
     last_status = None
 
     while time.time() < deadline:
         if proc.poll() is not None:
-            print("[浏览器] 浏览器被关闭")
+            print(f"\n[浏览器] ⚠️  {display_name} 已被关闭")
+            print("[浏览器] 登录后请不要手动关闭浏览器")
             break
 
         try:
             resp = requests.get(
-                "http://localhost:9222/json",
+                f"http://localhost:{port}/json",
                 timeout=5,
                 proxies={"http": None, "https": None}
             )
@@ -273,7 +344,7 @@ def try_remote_debugging(browser_name='chrome'):
                 break
 
             if last_status != 'waiting':
-                print("[浏览器] 等待登录中...")
+                print("[浏览器] 等待登录中...（登录后请不要关闭浏览器）")
                 last_status = 'waiting'
         except Exception as e:
             print(f"[浏览器] 检测中: {e}")
@@ -287,7 +358,6 @@ def try_remote_debugging(browser_name='chrome'):
         return cookie_dict
     print("[浏览器] 未获取到 Cookie")
     return None
-
 
 # ========== 方式二：Firefox 静态读取 ==========
 
